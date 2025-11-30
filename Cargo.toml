@@ -1,0 +1,8 @@
+[package]
+name = "samurai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.15.0"
+tch = "0.22.0"
