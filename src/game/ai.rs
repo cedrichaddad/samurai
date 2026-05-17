@@ -1,8 +1,16 @@
 use bevy::prelude::*;
 use tch::{CModule, Tensor};
-use crate::game::combat::{CharacterState, ActionTimer, Health};
+use crate::game::combat::{CharacterState, ActionTimer, FrameWindow, Health, Velocity, ATTACK_DURATION, PARRY_DURATION, DODGE_DURATION, ARENA_RADIUS};
+use crate::game::feel::{
+    DODGE_IFRAMES, DODGE_RECOVERY, DODGE_STARTUP, LIGHT_ACTIVE, LIGHT_RECOVERY, LIGHT_STARTUP,
+    PARRY_PERFECT_FRAMES, PARRY_RECOVERY, PARRY_TOTAL,
+};
+use crate::game::fusion::{fuse_decision, BossDecisionInput, BossStyle};
+use crate::game::instinct::Instinct;
+use crate::game::memory::PredictedPlayerWindow;
 use crate::game::player::Player;
 use crate::game::boss::Boss;
+use crate::game::rush::CurrentBossConfig;
 
 #[derive(Resource)]
 pub struct BossModel {
@@ -34,11 +42,16 @@ pub fn load_boss_model(mut commands: Commands) {
 }
 
 pub fn boss_ai_system(
-    mut boss_query: Query<(&mut Transform, &mut CharacterState, &mut ActionTimer, &Health, &mut crate::game::aggression::BossAggressionTimer, &mut PreviousPosition, &mut BossMemory, &mut crate::game::boss::BossAttackCooldown), With<Boss>>,
+    mut commands: Commands,
+    mut boss_query: Query<(Entity, &Transform, &mut CharacterState, &mut ActionTimer, &mut FrameWindow, &Health, &mut crate::game::aggression::BossAggressionTimer, &mut PreviousPosition, &mut BossMemory, &mut crate::game::boss::BossAttackCooldown, &mut crate::game::boss::BossFeintTimer, &mut Velocity), With<Boss>>,
     mut player_query: Query<(&Transform, &CharacterState, &ActionTimer, &Health, &mut PreviousPosition), (With<Player>, Without<Boss>)>,
     boss_model: Option<Res<BossModel>>,
     player_stats: Res<crate::game::stats::PlayerStats>,
     time: Res<Time>,
+    instinct: Option<Res<Instinct>>,
+    prediction: Option<Res<PredictedPlayerWindow>>,
+    current_cfg: Option<Res<CurrentBossConfig>>,
+    db: Option<Res<crate::game::memory::BossMemoryDb>>,
 ) {
     if let Some(m) = boss_model {
         let model = &m.model;
@@ -49,9 +62,40 @@ pub fn boss_ai_system(
         return;
     };
 
-    for (mut boss_tf, mut boss_state, mut boss_timer, boss_health, mut aggression_timer, mut boss_prev_pos, mut boss_memory, mut boss_cooldown) in &mut boss_query {
-        // 0. Update Cooldown
+    for (boss_e, boss_tf, mut boss_state, mut boss_timer, mut boss_window, boss_health, mut aggression_timer, mut boss_prev_pos, mut boss_memory, mut boss_cooldown, mut boss_feint, mut boss_velocity) in &mut boss_query {
+        // 0. Update Timers
         boss_cooldown.timer.tick(time.delta());
+        boss_feint.timer.tick(time.delta());
+
+        // --- TRAP LOGIC START ---
+        if boss_feint.active {
+            // TRAP TRIGGER: Player attacked while we were baiting
+            if *player_state == CharacterState::Attack {
+                println!("*** TRAP SPRUNG: Punishing Player! ***");
+                
+                // Immediate Parry (Hyper-response)
+                *boss_state = CharacterState::Parry;
+                boss_timer.timer = Timer::from_seconds(PARRY_DURATION, TimerMode::Once);
+                boss_timer.next_state = Some(CharacterState::Idle);
+                
+                // Reset Trap
+                boss_feint.active = false; 
+                continue; // Skip inference
+            } 
+            // TRAP EXPIRED: Player didn't bite after bait duration (using boss_timer which was set to 0.5s)
+            else if boss_timer.timer.finished() {
+                 boss_feint.active = false;
+                 // Return to normal AI next frame
+            }
+            else {
+                // Continue Baiting (Wait)
+                // Update physics but skip inference
+                // We need to run physics below, so let's NOT continue here, but skip inference block?
+                // Or just force action=0?
+                // Let's force action=0 and skip inference.
+            }
+        }
+        // --- TRAP LOGIC END ---
         // Calculate Velocity (before early return?)
         // Actually, we should update prev_pos every frame regardless of state?
         // But this system runs every frame.
@@ -71,9 +115,10 @@ pub fn boss_ai_system(
             
             // ONLY Lunge if we are not already hugging the player (Dist > 1.2)
             if dist_to_player > 1.2 { 
-                 if boss_timer.timer.remaining_secs() > (crate::game::combat::ATTACK_DURATION * 0.3) {
+                 if boss_timer.timer.remaining_secs() > (ATTACK_DURATION * 0.3) {
                     let dir = (player_tf.translation - boss_tf.translation).normalize_or_zero();
-                    boss_tf.translation += dir * 2.0 * time.delta_secs(); 
+                    // boss_tf.translation += dir * 2.0 * time.delta_secs(); 
+                    boss_velocity.0 = dir * 2.0;
                 }
             }
         }
@@ -103,20 +148,22 @@ pub fn boss_ai_system(
         let cos_angle = forward.dot(to_player);
         let sin_angle = forward.cross(to_player).y;
         
-        // Map states to float
+        // Map states to float. Block reads as a defensive state (same bucket
+        // as Parry) for the policy — keeps the existing model usable without
+        // retraining.
         let map_state = |s: &CharacterState| -> f32 {
             match s {
                 CharacterState::Idle => 0.0,
                 CharacterState::Move => 1.0,
                 CharacterState::Attack => 2.0,
-                CharacterState::Parry => 3.0,
+                CharacterState::Parry | CharacterState::Block => 3.0,
                 CharacterState::Dodge => 4.0,
                 CharacterState::Stunned => 5.0,
             }
         };
 
         let obs_vec = vec![
-            dist / 10.0, // Normalize by arena size approx
+            dist / ARENA_RADIUS, // Normalize by arena size approx
             cos_angle,
             sin_angle,
             rel_vel.x / 10.0,
@@ -148,6 +195,14 @@ pub fn boss_ai_system(
         let obs_tensor = Tensor::from_slice(&boss_memory.history).unsqueeze(0); // [1, 52]
         
         // Inference
+        // Skip inference if trapping
+        if boss_feint.active {
+             // Just wait (physics will run below/above)
+             // Actually physics ran above.
+             // We just need to skip the rest.
+             continue;
+        }
+
         let action_tensor = model.forward_ts(&[obs_tensor]);
         
         match action_tensor {
@@ -166,66 +221,150 @@ pub fn boss_ai_system(
                 // 6: Parry
                 // 7: Dodge
                 
-                // Adaptive Override (Heuristic)
-                // If player parries a lot (>3 in last 10s), feint (Wait instead of Attack)
-                if action == 5 && player_stats.parry_count > 3 {
-                    println!("Boss adapts: Feinting due to high parry count!");
-                    action = 0; // Force Wait
-                    boss_memory.last_action = 0; // Update memory so the AI knows what actually happened
-                    *boss_state = CharacterState::Idle; // Feint
+                // === Decision fusion: combine TorchScript policy with vibrato
+                // dossier prediction and in-match instinct, gated by reaction
+                // delay and a mistake budget. Boss-style is per-stage. ===
+                let style = current_cfg
+                    .as_ref()
+                    .and_then(|c| c.0.as_ref().map(|b| b.style))
+                    .unwrap_or(BossStyle::None);
+                let reaction_delay_ticks = current_cfg
+                    .as_ref()
+                    .and_then(|c| c.0.as_ref().map(|b| b.reaction_delay_ticks))
+                    .unwrap_or(0);
+                let mistake_rate = current_cfg
+                    .as_ref()
+                    .and_then(|c| c.0.as_ref().map(|b| b.mistake_rate))
+                    .unwrap_or(0.0);
+                let current_tick = db
+                    .as_ref()
+                    .map(|d| d.tick)
+                    .unwrap_or(0);
+                // Mimic uses the matched-window's first-future-action as its
+                // hint when available (cross-match) and falls back to the
+                // instinct match's last_action (in-match) otherwise.
+                let mimic_hint = if matches!(style, BossStyle::Mimic) {
+                    prediction
+                        .as_ref()
+                        .and_then(|p| p.futures.first().and_then(|f| f.first().copied()))
+                } else {
+                    None
+                };
+                let instinct_match = instinct.as_ref().and_then(|i| i.nearest());
+                let prediction_ref = prediction.as_deref();
+                let fused = fuse_decision(BossDecisionInput {
+                    policy_action: action as u8,
+                    style,
+                    instinct: instinct_match,
+                    prediction: prediction_ref,
+                    current_tick,
+                    reaction_delay_ticks,
+                    mistake_rate,
+                    mimic_action_hint: mimic_hint,
+                });
+                action = fused.action as i64;
+
+                // Trap-setup safety: if Pattern-Breaker / Counter-Sage want to
+                // Wait while baiting parry-happy players, prime the existing
+                // feint timer so the trap-trigger snap-parry stays available.
+                let player_parry_pressure = player_stats.parry_count > 4;
+                if fused.reason == "counter-sage"
+                    && player_parry_pressure
+                    && action == 0
+                    && boss_feint.timer.finished()
+                    && !boss_feint.active
+                {
+                    boss_feint.active = true;
+                    boss_feint.timer.reset();
+                    boss_timer.timer = Timer::from_seconds(0.5, TimerMode::Once);
+                    boss_memory.last_action = 0;
+                    *boss_state = CharacterState::Idle;
                     return;
                 }
-                
-                // If player dodges a lot, maybe wait to catch them?
-                if action == 5 && player_stats.dodge_count > 3 {
-                     // Delay attack?
-                }
 
-                // Heuristic: Force approach if too far
-                if dist > 3.0 {
-                    action = 1; // Move Forward
+                // Final safety: if we're far enough away that no reaction
+                // matters, just close. This stays from the original baseline.
+                if action == 0 && dist > 3.5 {
+                    action = 1;
                 }
-
-                // Heuristic: Force attack if close and aggression timer finished
-                // if dist < 2.5 && aggression_timer.timer.finished() {
-                //     println!("Boss Aggression: Forcing Attack!");
-                //     action = 5; // Attack
-                //     aggression_timer.timer.reset();
-                // }
 
                 match action {
                     0 => { *boss_state = CharacterState::Idle; },
-                    1 => { 
-                        // Move Forward
-                        let dir = (player_tf.translation - boss_tf.translation).normalize_or_zero();
-                        boss_tf.translation += dir * 5.0 * time.delta_secs();
-                        *boss_state = CharacterState::Move;
+                    1 => {
+                        let dist = boss_tf.translation.distance(player_tf.translation);
+                        if dist > 1.5 {
+                            let dir = (player_tf.translation - boss_tf.translation).normalize_or_zero();
+                            boss_velocity.0 = dir * 5.0;
+                            *boss_state = CharacterState::Move;
+                        } else {
+                            *boss_state = CharacterState::Idle;
+                        }
                     },
                     2 => {
-                        // Move Backward
                         let dir = (boss_tf.translation - player_tf.translation).normalize_or_zero();
-                        boss_tf.translation += dir * 5.0 * time.delta_secs();
+                        boss_velocity.0 = dir * 5.0;
                         *boss_state = CharacterState::Move;
                     },
                     3 | 4 => {
-                        // Strafe (simplified to just move random side or just wait for now)
                         *boss_state = CharacterState::Move;
                     },
                     5 => {
                         *boss_state = CharacterState::Attack;
-                        boss_timer.timer = Timer::from_seconds(crate::game::combat::ATTACK_DURATION, TimerMode::Once);
+                        *boss_window = FrameWindow::new(
+                            LIGHT_STARTUP,
+                            LIGHT_ACTIVE,
+                            LIGHT_RECOVERY,
+                        );
+                        boss_timer.timer =
+                            Timer::from_seconds(boss_window.total_secs(), TimerMode::Once);
                         boss_timer.next_state = Some(CharacterState::Idle);
-                        // Set Cooldown: Animation + 0.5s Recovery
-                        boss_cooldown.timer = Timer::from_seconds(crate::game::combat::ATTACK_DURATION + 0.5, TimerMode::Once);
+                        boss_cooldown.timer = Timer::from_seconds(
+                            boss_window.total_secs() + 0.4,
+                            TimerMode::Once,
+                        );
+                        // Roll for an unblockable telegraph. Probability comes
+                        // from the boss roster (rises 0 → 0.20 across the 5
+                        // stages). Telegraph runs the full attack window so
+                        // the player has time to read it and dodge.
+                        let unblockable_chance = current_cfg
+                            .as_ref()
+                            .and_then(|c| c.0.as_ref().map(|b| b.unblockable_chance))
+                            .unwrap_or(0.0);
+                        if unblockable_chance > 0.0 {
+                            // Cheap deterministic [0,1) keyed on (tick, entity).
+                            let mut x = current_tick
+                                .wrapping_add(boss_e.to_bits() as u64)
+                                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                            x ^= x >> 33;
+                            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                            x ^= x >> 33;
+                            let r = ((x >> 40) as f32) / ((1u64 << 24) as f32);
+                            if r < unblockable_chance {
+                                commands.entity(boss_e).insert(
+                                    crate::game::vfx::Unblockable {
+                                        remaining_s: boss_window.total_secs() + 0.05,
+                                    },
+                                );
+                            }
+                        }
                     },
                     6 => {
                         *boss_state = CharacterState::Parry;
-                        boss_timer.timer = Timer::from_seconds(crate::game::combat::PARRY_DURATION, TimerMode::Once);
+                        *boss_window = FrameWindow::new(0, PARRY_TOTAL, PARRY_RECOVERY)
+                            .with_perfect(PARRY_PERFECT_FRAMES);
+                        boss_timer.timer =
+                            Timer::from_seconds(PARRY_DURATION, TimerMode::Once);
                         boss_timer.next_state = Some(CharacterState::Idle);
                     },
                     7 => {
                         *boss_state = CharacterState::Dodge;
-                        boss_timer.timer = Timer::from_seconds(crate::game::combat::DODGE_DURATION, TimerMode::Once);
+                        *boss_window = FrameWindow::new(
+                            DODGE_STARTUP,
+                            DODGE_IFRAMES,
+                            DODGE_RECOVERY,
+                        );
+                        boss_timer.timer =
+                            Timer::from_seconds(DODGE_DURATION, TimerMode::Once);
                         boss_timer.next_state = Some(CharacterState::Idle);
                     },
                     _ => {}
